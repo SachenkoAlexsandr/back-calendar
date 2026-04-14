@@ -277,11 +277,11 @@ def get_tasks(from_: str = "", to: str = "", user=Depends(require_user)):
         rows = conn.execute(
             """SELECT * FROM tasks WHERE user_id=?
                AND (
-                 (week_from >= ? AND week_to <= ?)
+                 (week_from <= ? AND week_to >= ?)
                  OR (date >= ? AND date <= ?)
                )
                ORDER BY urgent DESC, done ASC, id ASC""",
-            (user["id"], from_, to, from_, to)
+            (user["id"], to, from_, from_, to)
         ).fetchall()
     else:
         today = date.today().isoformat()
