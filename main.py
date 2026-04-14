@@ -5,7 +5,7 @@ import hashlib
 import secrets
 from datetime import datetime, date, timedelta
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -271,17 +271,21 @@ class TaskToggle(BaseModel):
 # ── Task routes ───────────────────────────────────────────────────────────────
 
 @app.get("/tasks")
-def get_tasks(from_: str = "", to: str = "", user=Depends(require_user)):
+def get_tasks(
+    from_: str = Query("", alias="from"),
+    to: str = "",
+    user=Depends(require_user),
+):
     conn = get_db()
     if from_ and to:
         rows = conn.execute(
             """SELECT * FROM tasks WHERE user_id=?
                AND (
-                 (week_from <= ? AND week_to >= ?)
+                 (week_from >= ? AND week_to <= ?)
                  OR (date >= ? AND date <= ?)
                )
                ORDER BY urgent DESC, done ASC, id ASC""",
-            (user["id"], to, from_, from_, to)
+            (user["id"], from_, to, from_, to)
         ).fetchall()
     else:
         today = date.today().isoformat()
@@ -360,7 +364,11 @@ class EventCreate(BaseModel):
 # ── Event routes ──────────────────────────────────────────────────────────────
 
 @app.get("/events")
-def get_events(from_: str = "", to: str = "", user=Depends(require_user)):
+def get_events(
+    from_: str = Query("", alias="from"),
+    to: str = "",
+    user=Depends(require_user),
+):
     conn = get_db()
     if from_ and to:
         rows = conn.execute(
