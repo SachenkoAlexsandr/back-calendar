@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import httpx
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -69,6 +69,37 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
 
+        CREATE TABLE IF NOT EXISTS event_templates (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER NOT NULL,
+            title        TEXT NOT NULL,
+            start        TEXT NOT NULL,
+            duration     INTEGER DEFAULT 30,
+            color        TEXT DEFAULT 'blue',
+            remind       INTEGER DEFAULT 15,
+            rule         TEXT NOT NULL,
+            weekdays     TEXT DEFAULT '',
+            monthday     INTEGER DEFAULT 0,
+            start_date   TEXT NOT NULL,
+            end_date     TEXT DEFAULT '',
+            created      TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS event_template_exceptions (
+            template_id  INTEGER NOT NULL,
+            date         TEXT NOT NULL,
+            PRIMARY KEY (template_id, date),
+            FOREIGN KEY(template_id) REFERENCES event_templates(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS event_template_reminded (
+            template_id  INTEGER NOT NULL,
+            date         TEXT NOT NULL,
+            PRIMARY KEY (template_id, date),
+            FOREIGN KEY(template_id) REFERENCES event_templates(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS streaks (
             user_id      INTEGER PRIMARY KEY,
             streak       INTEGER DEFAULT 0,
@@ -110,6 +141,61 @@ def require_user(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Токен недействителен. Войди заново.")
     return dict(user)
 
+# ── Recurrence helpers ────────────────────────────────────────────────────────
+
+def _parse_iso(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+def expand_template(tpl: dict, range_from: date, range_to: date) -> List[date]:
+    """Возвращает список дат, когда шаблон срабатывает в диапазоне [range_from, range_to]."""
+    rule = tpl["rule"]
+    start = _parse_iso(tpl["start_date"])
+    end = _parse_iso(tpl["end_date"]) if tpl.get("end_date") else None
+
+    lo = max(range_from, start)
+    hi = range_to if end is None else min(range_to, end)
+    if lo > hi:
+        return []
+
+    dates: List[date] = []
+
+    if rule == "weekly":
+        wdays = {int(x) for x in (tpl.get("weekdays") or "").split(",") if x != ""}
+        if not wdays:
+            return []
+        d = lo
+        while d <= hi:
+            if d.weekday() in wdays:
+                dates.append(d)
+            d += timedelta(days=1)
+
+    elif rule == "biweekly":
+        wdays = {int(x) for x in (tpl.get("weekdays") or "").split(",") if x != ""}
+        if not wdays:
+            return []
+        # "Активные" недели — те, где (номер недели с начала старта) чётный
+        start_monday = start - timedelta(days=start.weekday())
+        d = lo
+        while d <= hi:
+            if d.weekday() in wdays:
+                d_monday = d - timedelta(days=d.weekday())
+                weeks_diff = (d_monday - start_monday).days // 7
+                if weeks_diff >= 0 and weeks_diff % 2 == 0:
+                    dates.append(d)
+            d += timedelta(days=1)
+
+    elif rule == "monthly":
+        md = int(tpl.get("monthday") or 0)
+        if md < 1 or md > 31:
+            return []
+        d = lo
+        while d <= hi:
+            if d.day == md:
+                dates.append(d)
+            d += timedelta(days=1)
+
+    return dates
+
 # ── Reminders ─────────────────────────────────────────────────────────────────
 
 async def send_tg_message(chat_id: str, text: str):
@@ -130,10 +216,11 @@ async def reminder_loop():
         await asyncio.sleep(60)
         try:
             now = datetime.now()
-            today = date.today().isoformat()
+            today_d = date.today()
+            today = today_d.isoformat()
             conn = get_db()
 
-            # Get events that need reminders
+            # 1) Обычные события
             rows = conn.execute("""
                 SELECT e.*, u.username
                 FROM events e
@@ -145,16 +232,57 @@ async def reminder_loop():
                 ev_time = datetime.strptime(f"{today} {row['start']}", "%Y-%m-%d %H:%M")
                 remind_mins = row['remind']
                 diff = (ev_time - now).total_seconds() / 60
-                # Trigger if within [remind-1, remind+1] minute window
                 if remind_mins - 1 <= diff <= remind_mins + 1:
                     text = (
                         f"🔔 <b>Напоминание</b>\n\n"
                         f"Через {remind_mins} мин: <b>{row['title']}</b>\n"
                         f"Время: {row['start']}"
                     )
-                    # We use username as chat_id — user must have started the bot
                     await send_tg_message(row['username'], text)
                     conn.execute("UPDATE events SET reminded=1 WHERE id=?", (row['id'],))
+
+            # 2) Повторяющиеся события из шаблонов, которые срабатывают сегодня
+            tpl_rows = conn.execute("""
+                SELECT t.*, u.username
+                FROM event_templates t
+                JOIN users u ON u.id = t.user_id
+                WHERE t.remind > 0
+            """).fetchall()
+
+            for tpl_row in tpl_rows:
+                tpl = dict(tpl_row)
+                occurs = expand_template(tpl, today_d, today_d)
+                if not occurs:
+                    continue
+                # Пропуск если есть исключение
+                exc = conn.execute(
+                    "SELECT 1 FROM event_template_exceptions WHERE template_id=? AND date=?",
+                    (tpl["id"], today)
+                ).fetchone()
+                if exc:
+                    continue
+                # Пропуск если уже напоминали сегодня
+                rem = conn.execute(
+                    "SELECT 1 FROM event_template_reminded WHERE template_id=? AND date=?",
+                    (tpl["id"], today)
+                ).fetchone()
+                if rem:
+                    continue
+
+                ev_time = datetime.strptime(f"{today} {tpl['start']}", "%Y-%m-%d %H:%M")
+                remind_mins = tpl['remind']
+                diff = (ev_time - now).total_seconds() / 60
+                if remind_mins - 1 <= diff <= remind_mins + 1:
+                    text = (
+                        f"🔔 <b>Напоминание</b>\n\n"
+                        f"Через {remind_mins} мин: <b>{tpl['title']}</b>\n"
+                        f"Время: {tpl['start']}"
+                    )
+                    await send_tg_message(tpl_row['username'], text)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO event_template_reminded (template_id, date) VALUES (?,?)",
+                        (tpl["id"], today)
+                    )
 
             conn.commit()
             conn.close()
@@ -371,18 +499,61 @@ def get_events(
 ):
     conn = get_db()
     if from_ and to:
+        range_from = _parse_iso(from_)
+        range_to = _parse_iso(to)
         rows = conn.execute(
             "SELECT * FROM events WHERE user_id=? AND date>=? AND date<=? ORDER BY date ASC, start ASC",
             (user["id"], from_, to)
         ).fetchall()
     else:
         today = date.today().isoformat()
+        range_from = range_to = date.today()
         rows = conn.execute(
             "SELECT * FROM events WHERE user_id=? AND date=? ORDER BY start ASC",
             (user["id"], today)
         ).fetchall()
+
+    events_out = [dict(r) for r in rows]
+
+    # Разворачиваем шаблоны
+    tpl_rows = conn.execute(
+        "SELECT * FROM event_templates WHERE user_id=?", (user["id"],)
+    ).fetchall()
+    for tpl_row in tpl_rows:
+        tpl = dict(tpl_row)
+        occur_dates = expand_template(tpl, range_from, range_to)
+        if not occur_dates:
+            continue
+        # Собираем исключения одним запросом
+        exc_rows = conn.execute(
+            "SELECT date FROM event_template_exceptions WHERE template_id=?",
+            (tpl["id"],)
+        ).fetchall()
+        exceptions = {r["date"] for r in exc_rows}
+        for d in occur_dates:
+            diso = d.isoformat()
+            if diso in exceptions:
+                continue
+            events_out.append({
+                "id": f"t{tpl['id']}_{diso}",
+                "user_id": tpl["user_id"],
+                "title": tpl["title"],
+                "start": tpl["start"],
+                "duration": tpl["duration"],
+                "color": tpl["color"],
+                "remind": tpl["remind"],
+                "date": diso,
+                "reminded": 0,
+                "created": tpl["created"],
+                "template_id": tpl["id"],
+                "recurring": True,
+                "rule": tpl["rule"],
+            })
+
     conn.close()
-    return {"events": [dict(r) for r in rows]}
+    # Сортировка: по дате, потом по времени
+    events_out.sort(key=lambda e: (e["date"], e["start"]))
+    return {"events": events_out}
 
 @app.post("/events")
 def create_event(body: EventCreate, user=Depends(require_user)):
@@ -402,6 +573,107 @@ def create_event(body: EventCreate, user=Depends(require_user)):
 def delete_event(event_id: int, user=Depends(require_user)):
     conn = get_db()
     conn.execute("DELETE FROM events WHERE id=? AND user_id=?", (event_id, user["id"]))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+# ── Event templates (recurring events) ────────────────────────────────────────
+
+class EventTemplateCreate(BaseModel):
+    title: str
+    start: str
+    duration: int = 30
+    color: str = "blue"
+    remind: int = 15
+    rule: str                     # 'weekly' | 'biweekly' | 'monthly'
+    weekdays: List[int] = []      # 0..6 (Mon..Sun)
+    monthday: int = 0             # 1..31
+    start_date: str = ""
+    end_date: str = ""
+
+def _validate_template(body: EventTemplateCreate):
+    if body.rule not in ("weekly", "biweekly", "monthly"):
+        raise HTTPException(400, detail="rule должен быть weekly/biweekly/monthly")
+    if body.rule in ("weekly", "biweekly"):
+        if not body.weekdays or any(d < 0 or d > 6 for d in body.weekdays):
+            raise HTTPException(400, detail="Нужно выбрать хотя бы один день недели (0..6)")
+    if body.rule == "monthly":
+        if body.monthday < 1 or body.monthday > 31:
+            raise HTTPException(400, detail="monthday должен быть 1..31")
+
+@app.get("/event-templates")
+def list_templates(user=Depends(require_user)):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM event_templates WHERE user_id=? ORDER BY id DESC",
+        (user["id"],)
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["weekdays"] = [int(x) for x in (d.get("weekdays") or "").split(",") if x != ""]
+        out.append(d)
+    return {"templates": out}
+
+@app.post("/event-templates")
+def create_template(body: EventTemplateCreate, user=Depends(require_user)):
+    _validate_template(body)
+    sd = body.start_date or date.today().isoformat()
+    weekdays_csv = ",".join(str(d) for d in sorted(set(body.weekdays)))
+    conn = get_db()
+    cur = conn.execute(
+        """INSERT INTO event_templates
+           (user_id, title, start, duration, color, remind, rule, weekdays, monthday, start_date, end_date)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (user["id"], body.title, body.start, body.duration, body.color, body.remind,
+         body.rule, weekdays_csv, body.monthday, sd, body.end_date)
+    )
+    tpl_id = cur.lastrowid
+    conn.commit()
+    row = dict(conn.execute("SELECT * FROM event_templates WHERE id=?", (tpl_id,)).fetchone())
+    conn.close()
+    row["weekdays"] = [int(x) for x in (row.get("weekdays") or "").split(",") if x != ""]
+    return row
+
+@app.delete("/event-templates/{tpl_id}")
+def delete_template(tpl_id: int, user=Depends(require_user)):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM event_templates WHERE id=? AND user_id=?",
+        (tpl_id, user["id"])
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, detail="Шаблон не найден")
+    conn.execute("DELETE FROM event_template_exceptions WHERE template_id=?", (tpl_id,))
+    conn.execute("DELETE FROM event_template_reminded WHERE template_id=?", (tpl_id,))
+    conn.execute("DELETE FROM event_templates WHERE id=?", (tpl_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.delete("/event-templates/{tpl_id}/occurrence/{occ_date}")
+def skip_occurrence(tpl_id: int, occ_date: str, user=Depends(require_user)):
+    """Удалить один конкретный повтор (добавить в исключения). Шаблон продолжит действовать."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM event_templates WHERE id=? AND user_id=?",
+        (tpl_id, user["id"])
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, detail="Шаблон не найден")
+    # Проверим формат даты
+    try:
+        _parse_iso(occ_date)
+    except ValueError:
+        conn.close()
+        raise HTTPException(400, detail="Неверный формат даты, нужно YYYY-MM-DD")
+    conn.execute(
+        "INSERT OR IGNORE INTO event_template_exceptions (template_id, date) VALUES (?,?)",
+        (tpl_id, occ_date)
+    )
     conn.commit()
     conn.close()
     return {"ok": True}
